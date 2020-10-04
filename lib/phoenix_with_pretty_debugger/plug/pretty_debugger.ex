@@ -2,7 +2,7 @@ defmodule PhoenixWithPrettyDebugger.Plug.PrettyDebugger do
   @moduledoc """
   A module (**not a plug**) for debugging in development.
 
-  API compatible with `Phoenix.Debugger`.
+  The API is compatible with `Phoenix.Debugger`.
   """
 
   @already_sent {:plug_conn, :sent}
@@ -20,9 +20,12 @@ defmodule PhoenixWithPrettyDebugger.Plug.PrettyDebugger do
     monospace_font: "menlo, consolas, monospace"
   }
 
+  @debugger_replay_with_breakpoint_key "__debugger_set_breakpoint"
+
   import Plug.Conn
   require Logger
   alias PhoenixWithPrettyDebugger.Plug.PrettyDebugger.Highlighter
+  alias PhoenixWithPrettyDebugger.ConnStorage
 
   @doc false
   defmacro __using__(opts) do
@@ -33,27 +36,82 @@ defmodule PhoenixWithPrettyDebugger.Plug.PrettyDebugger do
   end
 
   @doc false
+  def maybe_add_breakpoint_and_replay_request(endpoint, conn) do
+    case {IEx.started?(), conn.path_info} do
+      {true, [@debugger_replay_with_breakpoint_key]} ->
+        # extract the conn id and the function we want to trace
+        conn = Plug.Conn.fetch_query_params(conn)
+        conn_id = conn.query_params["id"]
+        encoded_mfa = conn.query_params["mfa"]
+        {m, f, a} = decode_data(encoded_mfa)
+        # Insert breakpoint
+        IEx.break!(m, f, a)
+        # Get the old connection and options from storage
+        {old_conn, old_opts} = ConnStorage.get(conn_id)
+        # Create a response
+        response_text = """
+          Breakpoint entered.
+          You can now pry it on your IEx session.
+          """
+        # Send the response back to the client
+        send_resp(conn, 200, response_text)
+        # Replay the original request.
+        # I'm still not sure how this works.
+        endpoint.call(old_conn, old_opts)
+
+      _ ->
+        nil
+    end
+  end
+
+  defp encode_data(data) do
+    data
+    |> :erlang.term_to_binary()
+    |> Base.url_encode64()
+  end
+
+  defp decode_data(binary) do
+    binary
+    |> Base.url_decode64!()
+    |> :erlang.binary_to_term()
+  end
+
+  defp url_for_replaying_with_breakpoint(conn_id, mfa) do
+    encoded_mfa = encode_data(mfa)
+    "/#{@debugger_replay_with_breakpoint_key}?id=#{conn_id}&amp;mfa=#{encoded_mfa}"
+  end
+
+  @doc false
   defmacro __before_compile__(_) do
     quote location: :keep do
+      # Allows we to override the default `MyAppWeb.Endpoint.call/2` function,
+      # while storing it for use later (using `super/2`)
       defoverridable call: 2
 
+      # The function that will override the `MyAppWeb.Endpoint.call/2`
       def call(conn, opts) do
         try do
+          PhoenixWithPrettyDebugger.Plug.PrettyDebugger.maybe_add_breakpoint_and_replay_request(
+            __MODULE__,
+            conn
+          )
+
+          # Try to run the default call if available
           super(conn, opts)
         rescue
           e in Plug.Conn.WrapperError ->
             %{conn: conn, kind: kind, reason: reason, stack: stack} = e
-            PhoenixWithPrettyDebugger.Plug.PrettyDebugger.__catch__(conn, kind, reason, stack, @plug_debugger)
+            PhoenixWithPrettyDebugger.Plug.PrettyDebugger.__catch__(conn, kind, reason, stack, @plug_debugger, opts)
         catch
           kind, reason ->
-            PhoenixWithPrettyDebugger.Plug.PrettyDebugger.__catch__(conn, kind, reason, System.stacktrace(), @plug_debugger)
+            PhoenixWithPrettyDebugger.Plug.PrettyDebugger.__catch__(conn, kind, reason, System.stacktrace(), @plug_debugger, opts)
         end
       end
     end
   end
 
   @doc false
-  def __catch__(conn, kind, reason, stack, opts) do
+  def __catch__(conn, kind, reason, stack, opts, call_opts) do
     reason = Exception.normalize(kind, reason, stack)
     status = status(kind, reason)
 
@@ -64,7 +122,7 @@ defmodule PhoenixWithPrettyDebugger.Plug.PrettyDebugger do
         :erlang.raise(kind, reason, stack)
     after
       0 ->
-        render(conn, status, kind, reason, stack, opts)
+        render(conn, status, kind, reason, stack, opts, call_opts)
         log(status, kind, reason, stack)
         :erlang.raise(kind, reason, stack)
     end
@@ -80,29 +138,40 @@ defmodule PhoenixWithPrettyDebugger.Plug.PrettyDebugger do
 
   require EEx
 
-  @external_resource "lib/phoenix_with_pretty_debugger/plug/pretty_debugger/templates/debugger.html.eex"
-  @external_resource "lib/phoenix_with_pretty_debugger/plug/pretty_debugger/templates/debugger.md.eex"
-
   html_template_path = "lib/phoenix_with_pretty_debugger/plug/pretty_debugger/templates/debugger.html.eex"
+  markdown_template_path = "lib/phoenix_with_pretty_debugger/plug/pretty_debugger/templates/debugger.md.eex"
+  normalize_css_path = "lib/phoenix_with_pretty_debugger/plug/pretty_debugger/assets/normalize.css"
+  style_css_path = "lib/phoenix_with_pretty_debugger/plug/pretty_debugger/assets/style.css"
+
+  @external_resource normalize_css_path
+  @external_resource style_css_path
+  @external_resource html_template_path
+  @external_resource markdown_template_path
+
   EEx.function_from_file(:defp, :template_html, html_template_path, [:assigns])
 
-  markdown_template_path = "lib/phoenix_with_pretty_debugger/plug/pretty_debugger/templates/debugger.md.eex"
   EEx.function_from_file(:defp, :template_markdown, markdown_template_path, [:assigns])
+
+  EEx.function_from_file(:defp, :normalize_css, normalize_css_path, [:_assigns])
+
+  EEx.function_from_file(:defp, :style_css, style_css_path, [:assigns])
 
   # Made public with @doc false for testing.
   @doc false
-  def render(conn, status, kind, reason, stack, opts) do
+  def render(conn, status, kind, reason, stack, opts, call_opts) do
     session = maybe_fetch_session(conn)
     params = maybe_fetch_query_params(conn)
     {title, message} = info(kind, reason)
     style = Enum.into(opts[:style] || [], @default_style)
     banner = banner(conn, status, kind, reason, stack, opts)
+    conn_id = ConnStorage.put(conn, call_opts)
 
     if accepts_html?(get_req_header(conn, "accept")) do
       conn = put_resp_content_type(conn, "text/html")
 
       assigns = [
         conn: conn,
+        conn_id: conn_id,
         frames: frames(stack, opts),
         title: title,
         message: message,
@@ -126,6 +195,7 @@ defmodule PhoenixWithPrettyDebugger.Plug.PrettyDebugger do
 
       assigns = [
         conn: conn,
+        conn_id: conn_id,
         title: title,
         formatted: Exception.format(kind, reason, stack),
         session: session,
@@ -186,9 +256,8 @@ defmodule PhoenixWithPrettyDebugger.Plug.PrettyDebugger do
     highlighted_args = Highlighter.highlight_args(args)
 
     # It's possible that the `snippet` and the `args` won't be highlighted.
-    # This can happen, for example, because the `ElixirLexer` isn't available
-    # or if the `Highlighter` has been manually deactivated.
-    # In the case, we render them without syntax highlighting.
+    # This can happen, for example, because a supported lexer isn't available.
+    # In that case, we render them without syntax highlighting.
     # Even if they are not highlighted, they are escaped by the `Highlighter` module,
     # so that they can be added to the template whether they have been highlighted or not.
 
@@ -203,6 +272,7 @@ defmodule PhoenixWithPrettyDebugger.Plug.PrettyDebugger do
        doc: doc,
        clauses: clauses,
        args: highlighted_args,
+       mfa: {module, fun, arity},
        link: editor && get_editor(source, line, editor)
      }, index + 1}
   end
