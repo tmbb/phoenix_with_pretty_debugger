@@ -47,7 +47,7 @@ defmodule PhoenixWithPrettyDebugger.Plug.PrettyDebugger do
         # Insert breakpoint
         IEx.break!(m, f, a)
         # Get the old connection and options from storage
-        {old_conn, old_opts} = ConnStorage.get(conn_id)
+        {old_conn, old_opts} = ConnStorage.pop!(conn_id)
         # Create a response
         response_text = """
           Breakpoint entered.
